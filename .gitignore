@@ -1,0 +1,62 @@
+# ─── Environment & Secrets ────────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ─── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+build/
+*.egg
+.venv/
+venv/
+env/
+
+# ─── Node / Frontend ──────────────────────────────────────────────────────────
+node_modules/
+dist/
+
+# ─── Data files (may contain client data) ─────────────────────────────────────
+*.csv
+urls.txt
+urls.txt.bak
+fbJson.txt
+
+# ─── Misc dev artefacts ───────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.log
+*.bak
+*.tmp
+.vscode/
+.idea/
+
+# ─── Claude AI files (internal dev tooling — not for client) ──────────────────
+CLAUDE.md
+.claude/
+docs/claude.md
+
+# Claude-generated internal guides (kept out of client repo)
+GIT_BEST_PRACTICES.md
+META_API_INTEGRATION_GUIDE.md
+UI_IMPROVEMENT_GUIDE.md
+USER_NEEDS_ANALYSIS.md
+CHANGELOG.md
+
+# ─── Git internals (repo-in-repo artefacts) ───────────────────────────────────
+socialhubTest-claude-review-project-overview-d72PO/.git/
+socialhubTest-claude-review-project-overview-d72PO/config
+socialhubTest-claude-review-project-overview-d72PO/objects/
+socialhubTest-claude-review-project-overview-d72PO/refs/
+socialhubTest-claude-review-project-overview-d72PO/hooks/
+socialhubTest-claude-review-project-overview-d72PO/HEAD
+socialhubv2Automation/.git/
+socialhubv2Automation/config
+socialhubv2Automation/objects/
+socialhubv2Automation/refs/
+socialhubv2Automation/hooks/
+socialhubv2Automation/HEAD

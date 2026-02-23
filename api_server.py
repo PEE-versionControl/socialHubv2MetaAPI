@@ -1,0 +1,495 @@
+#!/usr/bin/env python3
+"""
+FastAPI Backend for Social Hub Reports
+========================================
+Provides async job management for generating Meta API insight reports.
+
+Endpoints:
+    POST /api/report/by-urls     → submit URLs for processing
+    POST /api/report/by-month    → submit month for auto-discovery
+    GET  /api/report/status/{id} → poll job progress + results
+    GET  /api/health             → backend health check
+    GET  /api/accounts           → list available accounts
+
+Start:
+    pip install fastapi uvicorn
+    uvicorn api_server:app --reload --port 8000
+"""
+
+import os
+import sys
+import time
+import uuid
+import threading
+from datetime import datetime
+
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+
+# Import from existing scripts
+from facebookSightTest5Feb import (
+    process_single_url,
+    parse_input_file,
+    ACCESS_TOKEN,
+    PAGE_ID,
+    AD_ACCOUNT_ID,
+)
+from live_fetch import fetch_live_counts, is_paused, reset_circuit_breaker
+from report_api import result_to_firestore_format, build_work_items_for_month
+
+
+app = FastAPI(title="Social Hub Report API", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows tunnel URLs (ngrok, cloudflare) and localhost dev
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# In-memory job store
+task_store: dict = {}
+
+
+# --- Account Registry ---
+# Auto-discover accounts from .env by scanning for *_FACEBOOK_PAGE_ID patterns
+ACCOUNTS = {}
+
+def _load_accounts():
+    """Scan .env for account credentials using PREFIX_FACEBOOK_PAGE_ID pattern."""
+    from dotenv import load_dotenv
+    load_dotenv()
+
+    # Track prefixes that have PAGE_ID
+    prefixes = set()
+    for key in os.environ:
+        if key.endswith("_FACEBOOK_PAGE_ID"):
+            prefix = key[: -len("_FACEBOOK_PAGE_ID")]
+            prefixes.add(prefix)
+
+    # For each prefix, build account dict
+    for prefix in prefixes:
+        page_id = os.getenv(f"{prefix}_FACEBOOK_PAGE_ID")
+        if not page_id:
+            continue
+
+        # Derive account name from prefix (convert PLAY_EAT_EASY -> Play Eat Easy)
+        account_name = prefix.replace("_", " ").title() if prefix else "Default"
+        account_key = prefix.lower() if prefix else "default"
+
+        ACCOUNTS[account_key] = {
+            "name": account_name,
+            "fb_token": os.getenv(f"{prefix}_FACEBOOK_ACCESS_TOKEN", ""),
+            "ig_token": os.getenv(f"{prefix}_IG_ACCESS_TOKEN", ""),
+            "page_id": page_id,
+            "ad_account_id": os.getenv(f"{prefix}_FACEBOOK_AD_ACCOUNT_ID", ""),
+            "ig_business_id": os.getenv(f"{prefix}_IG_BUSINESS_ID", ""),
+        }
+
+    # Add legacy unprefixed account if it exists.
+    # ACCOUNT_NAME env var lets you name this account (e.g. "Play Eat Easy").
+    if os.getenv("FACEBOOK_PAGE_ID") and "" not in [p for p in prefixes if p]:
+        ACCOUNTS["default"] = {
+            "name": os.getenv("ACCOUNT_NAME", "Default Account"),
+            "fb_token": os.getenv("FACEBOOK_ACCESS_TOKEN", ""),
+            "ig_token": os.getenv("IG_ACCESS_TOKEN", ""),
+            "page_id": os.getenv("FACEBOOK_PAGE_ID", ""),
+            "ad_account_id": os.getenv("FACEBOOK_AD_ACCOUNT_ID", ""),
+            "ig_business_id": os.getenv("IG_BUSINESS_ID", ""),
+        }
+
+_load_accounts()
+
+
+def _swap_account(account_key: str):
+    """Swap module-level globals in facebookSightTest5Feb to target account."""
+    import facebookSightTest5Feb as meta_api
+
+    if account_key not in ACCOUNTS:
+        raise ValueError(f"Unknown account: {account_key}")
+
+    acct = ACCOUNTS[account_key]
+    meta_api.ACCESS_TOKEN = acct["fb_token"]
+    meta_api.IG_ACCESS_TOKEN = acct["ig_token"]
+    meta_api.PAGE_ID = acct["page_id"]
+    meta_api.AD_ACCOUNT_ID = acct["ad_account_id"]
+
+    # Also update BASE_URL if needed (though it shouldn't change)
+    # meta_api.BASE_URL is constructed from API_VERSION which is constant
+
+
+# --- Request/Response Models ---
+
+class UrlReportRequest(BaseModel):
+    urls: list[dict]  # [{"url": "...", "end_date": "YYYY-MM-DD"}, ...]
+    include_live: bool = False
+
+class MonthReportRequest(BaseModel):
+    year_month: str  # "YYYY-MM"
+    include_live: bool = False
+    account_keys: list[str] = []  # Which accounts to process (empty = all)
+
+class JobResponse(BaseModel):
+    job_id: str
+    status: str
+
+
+# --- Helper: format result for frontend ---
+
+def format_result(r, live_counts=None, account_name=None):
+    """Convert process_single_url result to frontend-friendly dict.
+
+    Returns both display data and Firestore-compatible data for the
+    "Both approach": CSV download + save to Social Hub.
+    """
+    pm = r.get("post_metrics", {})
+    ad_list = r.get("ad_metrics") or []
+
+    out = {
+        "platform": r.get("platform", "Unknown"),
+        "url": r.get("url", ""),
+        "date_range": r.get("date_range_str", ""),
+        "views": pm.get("Views", 0),
+        "reach": pm.get("Reach", 0),
+        "interactions": pm.get("Interactions", 0),
+        "reactions": pm.get("Reactions_Total", 0),
+        "comments": pm.get("Comments", 0),
+        "shares": pm.get("Shares", 0),
+        "saves": pm.get("Saves", 0),
+        "link_clicks": pm.get("Link_Clicks", 0),
+        # Per-post ad metrics for CSV generation in frontend
+        "ad_metrics": [
+            {
+                "campaign_name": am.get("campaign_name", "N/A"),
+                "adset_name": am.get("adset_name", "N/A"),
+                "spend": round(am.get("spend", 0), 2),
+                "impressions": am.get("impressions", 0),
+                "reach": am.get("reach", 0),
+                "frequency": round(am.get("frequency", 0), 2),
+                "link_clicks": am.get("link_clicks", 0),
+                "clicks_all": am.get("clicks_all", 0),
+                "post_engagement": am.get("post_engagement", 0),
+                "reactions": am.get("reactions", 0),
+                "comments": am.get("comments", 0),
+                "shares": am.get("shares", 0),
+                "saves": am.get("saves", 0),
+                "thruplays": am.get("thruplays", 0),
+                "video_100": am.get("video_100", 0),
+            }
+            for am in ad_list
+        ],
+        # Firestore-compatible format for "Save to Social Hub"
+        "firestore": result_to_firestore_format(r, account_name=account_name),
+    }
+    if live_counts and "_error" not in live_counts:
+        out["live_reactions"] = live_counts.get("reaction_count", live_counts.get("like_count"))
+        out["live_comments"] = live_counts.get("comment_count")
+        out["live_shares"] = live_counts.get("share_count")
+
+    # Add account name if provided (for multi-account reports)
+    if account_name:
+        out["account"] = account_name
+
+    return out
+
+
+# --- Background Workers ---
+
+def _process_urls_worker(job_id: str, urls: list[dict], include_live: bool):
+    """Background worker for URL-based report."""
+    job = task_store[job_id]
+    job["total"] = len(urls)
+    results = []
+
+    if include_live:
+        reset_circuit_breaker()
+
+    # Determine account name from the currently active PAGE_ID (for IG posts that
+    # have no account name in the URL). Skip generic "Default Account" placeholder.
+    try:
+        import facebookSightTest5Feb as _meta
+        _active_page = str(getattr(_meta, "PAGE_ID", ""))
+        _url_account = next(
+            (a["name"] for a in ACCOUNTS.values()
+             if a.get("page_id") == _active_page and a["name"] != "Default Account"),
+            None
+        )
+    except Exception:
+        _url_account = None
+
+    for i, entry in enumerate(urls):
+        if job.get("cancelled"):
+            job["status"] = "cancelled"
+            return
+
+        url = entry.get("url", "")
+        end_date = entry.get("end_date", "")
+        job["progress"] = i
+        job["current_url"] = url
+
+        try:
+            result = process_single_url(url, end_date)
+            if result:
+                live = None
+                if include_live and not is_paused():
+                    live = fetch_live_counts(url)
+                    if is_paused():
+                        job["live_fetch_paused"] = True
+
+                formatted = format_result(result, live, account_name=_url_account)
+                results.append(formatted)
+                job["results"] = results
+        except Exception as e:
+            job["errors"] = job.get("errors", []) + [{"url": url, "error": str(e)}]
+
+        job["progress"] = i + 1
+
+    job["status"] = "completed"
+    job["results"] = results
+    job["completed_at"] = datetime.now().isoformat()
+
+
+def _process_month_worker(job_id: str, year_month: str, include_live: bool, account_keys: list[str] = None):
+    """Background worker for monthly report (supports multi-account)."""
+    job = task_store[job_id]
+
+    try:
+        parts = year_month.split("-")
+        year = int(parts[0])
+        month = int(parts[1])
+        if month < 1 or month > 12:
+            raise ValueError
+    except (ValueError, IndexError):
+        job["status"] = "failed"
+        job["error"] = f"Invalid month format: {year_month}"
+        return
+
+    if include_live:
+        reset_circuit_breaker()
+
+    # Determine which accounts to process
+    if not account_keys:
+        account_keys = list(ACCOUNTS.keys())
+    else:
+        # Validate account keys
+        invalid = [k for k in account_keys if k not in ACCOUNTS]
+        if invalid:
+            job["status"] = "failed"
+            job["error"] = f"Unknown account(s): {', '.join(invalid)}"
+            return
+
+    all_results = []
+
+    # Process each account
+    for account_idx, account_key in enumerate(account_keys):
+        if job.get("cancelled"):
+            job["status"] = "cancelled"
+            return
+
+        account = ACCOUNTS[account_key]
+        job["status_detail"] = f"[{account['name']}] Discovering posts and scanning ad end dates..."
+
+        # Swap to this account's credentials
+        try:
+            _swap_account(account_key)
+        except Exception as e:
+            job["errors"] = job.get("errors", []) + [{"url": f"Account: {account['name']}", "error": f"Failed to swap credentials: {str(e)}"}]
+            continue
+
+        # Build work items for this account
+        try:
+            work_items = build_work_items_for_month(year_month)
+        except Exception as e:
+            job["errors"] = job.get("errors", []) + [{"url": f"Account: {account['name']}", "error": f"Failed to discover posts: {str(e)}"}]
+            continue
+
+        if not work_items:
+            job["status_detail"] = f"[{account['name']}] No posts found"
+            continue
+
+        # Update total count (sum across all accounts)
+        if account_idx == 0:
+            job["total"] = len(work_items)
+        else:
+            job["total"] += len(work_items)
+
+        job["status_detail"] = f"[{account['name']}] Processing {len(work_items)} posts..."
+
+        # Process posts for this account
+        for i, item in enumerate(work_items):
+            if job.get("cancelled"):
+                job["status"] = "cancelled"
+                return
+
+            job["current_url"] = f"[{account['name']}] {item['url']}"
+
+            try:
+                result = process_single_url(item["url"], item["end_date"])
+                if result:
+                    live = None
+                    if include_live and not is_paused():
+                        live = fetch_live_counts(item["url"])
+                        if is_paused():
+                            job["live_fetch_paused"] = True
+
+                    formatted = format_result(result, live, account_name=account['name'])
+                    all_results.append(formatted)
+                    job["results"] = all_results
+            except Exception as e:
+                job["errors"] = job.get("errors", []) + [{"url": item["url"], "error": str(e)}]
+
+            job["progress"] += 1
+
+    job["status"] = "completed"
+    job["results"] = all_results
+    job["completed_at"] = datetime.now().isoformat()
+
+
+# --- Endpoints ---
+
+@app.get("/api/health")
+def health_check():
+    return {
+        "status": "ok",
+        "fb_token": bool(ACCESS_TOKEN),
+        "ig_token": bool(os.getenv("IG_ACCESS_TOKEN")),
+        "ad_account": bool(AD_ACCOUNT_ID),
+        "page_id": PAGE_ID,
+    }
+
+
+@app.get("/api/accounts")
+def list_accounts():
+    """Return list of available accounts from .env."""
+    return [
+        {
+            "key": key,
+            "name": acct["name"],
+            "page_id": acct["page_id"],
+            "has_fb_token": bool(acct["fb_token"]),
+            "has_ig_token": bool(acct["ig_token"]),
+            "has_ad_account": bool(acct["ad_account_id"]),
+        }
+        for key, acct in ACCOUNTS.items()
+    ]
+
+
+@app.post("/api/report/by-urls", response_model=JobResponse)
+def create_url_report(req: UrlReportRequest):
+    if not req.urls:
+        raise HTTPException(status_code=400, detail="No URLs provided")
+
+    job_id = str(uuid.uuid4())[:8]
+    task_store[job_id] = {
+        "status": "running",
+        "type": "by-urls",
+        "progress": 0,
+        "total": len(req.urls),
+        "current_url": "",
+        "results": [],
+        "errors": [],
+        "live_fetch_paused": False,
+        "created_at": datetime.now().isoformat(),
+    }
+
+    t = threading.Thread(
+        target=_process_urls_worker,
+        args=(job_id, req.urls, req.include_live),
+        daemon=True,
+    )
+    t.start()
+
+    return JobResponse(job_id=job_id, status="running")
+
+
+@app.post("/api/report/by-month", response_model=JobResponse)
+def create_month_report(req: MonthReportRequest):
+    job_id = str(uuid.uuid4())[:8]
+    task_store[job_id] = {
+        "status": "running",
+        "type": "by-month",
+        "progress": 0,
+        "total": 0,
+        "current_url": "",
+        "results": [],
+        "errors": [],
+        "live_fetch_paused": False,
+        "status_detail": "Starting...",
+        "created_at": datetime.now().isoformat(),
+    }
+
+    t = threading.Thread(
+        target=_process_month_worker,
+        args=(job_id, req.year_month, req.include_live, req.account_keys),
+        daemon=True,
+    )
+    t.start()
+
+    return JobResponse(job_id=job_id, status="running")
+
+
+@app.get("/api/report/status/{job_id}")
+def get_report_status(job_id: str):
+    if job_id not in task_store:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    job = task_store[job_id]
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "progress": job["progress"],
+        "total": job["total"],
+        "current_url": job.get("current_url", ""),
+        "results": job.get("results", []),
+        "errors": job.get("errors", []),
+        "live_fetch_paused": job.get("live_fetch_paused", False),
+        "status_detail": job.get("status_detail", ""),
+        "completed_at": job.get("completed_at"),
+    }
+
+
+@app.post("/api/report/cancel/{job_id}")
+def cancel_report(job_id: str):
+    if job_id not in task_store:
+        raise HTTPException(status_code=404, detail="Job not found")
+    task_store[job_id]["cancelled"] = True
+    return {"status": "cancelling"}
+
+
+# --- Static File Serving (Demo / Remote Access Mode) ---
+# Serves the built React app so the whole project runs on one port (8000).
+# This lets you expose a single tunnel URL to a remote client.
+#
+# Steps to enable:
+#   1. cd socialhubv2Automation && npm run build
+#   2. uvicorn api_server:app --host 0.0.0.0 --port 8000
+#   3. Expose with:  ngrok http 8000   OR   cloudflared tunnel --url http://localhost:8000
+#   4. Share the public URL with the client — no other steps needed.
+#
+# Priority: dist/ inside the frontend project dir > static/ (legacy copy)
+
+_BASE = os.path.dirname(os.path.abspath(__file__))
+_DIST = os.path.join(_BASE, "socialhubv2Automation", "dist")
+_STATIC_LEGACY = os.path.join(_BASE, "static")
+STATIC_DIR = _DIST if os.path.isdir(_DIST) else (_STATIC_LEGACY if os.path.isdir(_STATIC_LEGACY) else None)
+
+if STATIC_DIR:
+    # Serve static assets (JS, CSS, images, fonts)
+    _assets = os.path.join(STATIC_DIR, "assets")
+    if os.path.isdir(_assets):
+        app.mount("/assets", StaticFiles(directory=_assets), name="assets")
+
+    # Catch-all: serve index.html for any non-API route (React SPA routing)
+    @app.get("/{full_path:path}")
+    async def serve_spa(full_path: str):
+        if full_path.startswith("api/"):
+            raise HTTPException(status_code=404)
+        file_path = os.path.join(STATIC_DIR, full_path)
+        if os.path.isfile(file_path):
+            return FileResponse(file_path)
+        return FileResponse(os.path.join(STATIC_DIR, "index.html"))
