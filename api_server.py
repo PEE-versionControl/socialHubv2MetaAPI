@@ -22,11 +22,12 @@ import time
 import uuid
 import threading
 from datetime import datetime
+from urllib.parse import quote as _url_quote
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
 # Import from existing scripts
@@ -39,6 +40,7 @@ from facebookSightTest5Feb import (
 )
 from live_fetch import fetch_live_counts, is_paused, reset_circuit_breaker
 from report_api import result_to_firestore_format, build_work_items_for_month
+from excel_report import generate_excel_report, generate_excel_report_combined
 
 
 app = FastAPI(title="Social Hub Report API", version="1.0.0")
@@ -49,6 +51,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
 )
 
 
@@ -167,6 +170,8 @@ def format_result(r, live_counts=None, account_name=None):
             {
                 "campaign_name": am.get("campaign_name", "N/A"),
                 "adset_name": am.get("adset_name", "N/A"),
+                "date_start": am.get("date_start", ""),
+                "adset_start_time": am.get("adset_start_time", ""),
                 "spend": round(am.get("spend", 0), 2),
                 "impressions": am.get("impressions", 0),
                 "reach": am.get("reach", 0),
@@ -183,6 +188,9 @@ def format_result(r, live_counts=None, account_name=None):
             }
             for am in ad_list
         ],
+        # IDs for image fetching in Excel report
+        "ig_media_id": r.get("_ig_media_id", ""),
+        "fb_post_id": r.get("_post_id", ""),
         # Firestore-compatible format for "Save to Social Hub"
         "firestore": result_to_firestore_format(r, account_name=account_name),
     }
@@ -459,6 +467,125 @@ def cancel_report(job_id: str):
         raise HTTPException(status_code=404, detail="Job not found")
     task_store[job_id]["cancelled"] = True
     return {"status": "cancelling"}
+
+
+def _content_disposition(filename: str) -> str:
+    """Build a Content-Disposition header that safely handles Unicode filenames.
+
+    HTTP headers must be Latin-1 encodable. Campaign names often contain
+    en/em dashes and other Unicode characters that crash header encoding.
+    We use RFC 5987 (filename*=UTF-8'') for full Unicode support, with an
+    ASCII fallback for older clients.
+    """
+    ascii_name = filename.encode("ascii", "replace").decode("ascii").replace("?", "_")
+    utf8_name = _url_quote(filename, safe=" -()+#.,")
+    return f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{utf8_name}'
+
+
+@app.get("/api/report/excel/{job_id}")
+def download_excel_combined(job_id: str):
+    """Generate combined Excel report for all results in a job (FB + IG on one sheet)."""
+    job = task_store.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    results = job.get("results", [])
+    if not results:
+        raise HTTPException(status_code=404, detail="No results in job")
+
+    import facebookSightTest5Feb as _meta
+    fb_token   = getattr(_meta, "ACCESS_TOKEN",    os.getenv("FACEBOOK_ACCESS_TOKEN", ""))
+    ig_token   = getattr(_meta, "IG_ACCESS_TOKEN", os.getenv("IG_ACCESS_TOKEN", ""))
+    page_id    = getattr(_meta, "PAGE_ID",         os.getenv("FACEBOOK_PAGE_ID", ""))
+    ig_user_id = os.getenv("IG_BUSINESS_ID", "")
+
+    buf = generate_excel_report_combined(
+        results,
+        fb_token=fb_token,
+        ig_token=ig_token,
+        page_id=page_id,
+        ig_user_id=ig_user_id,
+    )
+    # Extract campaign info for filename: "#12345 CampaignName Post-Buy Report.xlsx"
+    from excel_report import parse_campaign_header as _parse_header
+    import re as _re
+    _adset_names = []
+    _campaign_names = []
+    for r in results:
+        _adset_names += [am.get("adset_name", "") for am in r.get("ad_metrics", [])]
+        _campaign_names += [am.get("campaign_name", "") for am in r.get("ad_metrics", [])]
+    _campaign = _parse_header(_adset_names, _campaign_names)
+    print(f"  [Excel filename] adset_names={_adset_names[:3]}, campaign_names={_campaign_names[:3]}")
+    print(f"  [Excel filename] parsed: code='{_campaign.get('code','')}', name='{_campaign.get('name','')}'")
+    print(f"  [Excel filename] full_campaign_name='{_campaign.get('full_campaign_name','')}'")
+    code = _campaign.get("code", "")
+    name = _campaign.get("name", "")
+    if code and name:
+        safe_name = _re.sub(r'[<>:"/\\|?*]', '', f"#{code} {name}").strip()
+        filename = f"{safe_name} Post-Buy Report.xlsx"
+    elif name:
+        safe_name = _re.sub(r'[<>:"/\\|?*]', '', name).strip()
+        filename = f"{safe_name} Post-Buy Report.xlsx"
+    else:
+        date_str = datetime.now().strftime("%Y%m%d")
+        filename = f"report_combined_{date_str}.xlsx"
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": _content_disposition(filename)},
+    )
+
+
+@app.get("/api/report/excel/{job_id}/{result_index}")
+def download_excel_report(job_id: str, result_index: int):
+    """Generate and return an Excel (.xlsx) report for a single result."""
+    job = task_store.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    results = job.get("results", [])
+    if result_index >= len(results):
+        raise HTTPException(status_code=404, detail="Result index out of range")
+
+    result = results[result_index]
+
+    # Use the currently active credentials (swapped per account)
+    import facebookSightTest5Feb as _meta
+    fb_token   = getattr(_meta, "ACCESS_TOKEN",    os.getenv("FACEBOOK_ACCESS_TOKEN", ""))
+    ig_token   = getattr(_meta, "IG_ACCESS_TOKEN", os.getenv("IG_ACCESS_TOKEN", ""))
+    page_id    = getattr(_meta, "PAGE_ID",         os.getenv("FACEBOOK_PAGE_ID", ""))
+    ig_user_id = os.getenv("IG_BUSINESS_ID", "")
+
+    buf = generate_excel_report(
+        result,
+        fb_token=fb_token,
+        ig_token=ig_token,
+        page_id=page_id,
+        ig_user_id=ig_user_id,
+    )
+
+    # Extract campaign info for filename: "#12345 CampaignName Post-Buy Report.xlsx"
+    from excel_report import parse_campaign_header as _parse_header
+    import re as _re
+    _adset_names = [am.get("adset_name", "") for am in result.get("ad_metrics", [])]
+    _campaign_names = [am.get("campaign_name", "") for am in result.get("ad_metrics", [])]
+    _campaign = _parse_header(_adset_names, _campaign_names)
+    code = _campaign.get("code", "")
+    name = _campaign.get("name", "")
+    if code and name:
+        safe_name = _re.sub(r'[<>:"/\\|?*]', '', f"#{code} {name}").strip()
+        filename = f"{safe_name} Post-Buy Report.xlsx"
+    elif name:
+        safe_name = _re.sub(r'[<>:"/\\|?*]', '', name).strip()
+        filename = f"{safe_name} Post-Buy Report.xlsx"
+    else:
+        platform = result.get("platform", "")[:2].upper()
+        date_str = datetime.now().strftime("%Y%m%d")
+        filename = f"report_{platform}_{result_index}_{date_str}.xlsx"
+
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": _content_disposition(filename)},
+    )
 
 
 # --- Static File Serving (Demo / Remote Access Mode) ---

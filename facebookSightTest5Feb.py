@@ -62,6 +62,59 @@ def safe_api_call(url, params, description="API call"):
         return None
 
 
+def resolve_pfbid(url):
+    """Resolve a pfbid-format Facebook URL to a numeric post ID.
+
+    Strategy 1: Direct pfbid node lookup — GET /{pfbid}?fields=id
+    Strategy 2: URL resolver — GET /?id={url}&fields=id (with validation)
+
+    The URL resolver often echoes the pfbid URL back unchanged; we validate
+    that the returned id is numeric/composite (not a URL or pfbid string).
+
+    Returns the raw numeric post ID (without PAGE_ID prefix), or None on failure.
+    """
+    # Extract the pfbid token from the URL (use broad pattern to capture dashes too)
+    match = re.search(r'/posts/([^/?#\s]+)', url)
+    if not match or not match.group(1).startswith("pfbid"):
+        print(f"  [pfbid] Could not extract pfbid token from URL.")
+        return None
+    pfbid_str = match.group(1)
+    print(f"  [pfbid] Resolving {pfbid_str[:24]}... to numeric post ID...")
+
+    def _extract_raw_id(obj_id):
+        """Return raw post ID from composite PAGE_ID_POST_ID, or None if invalid."""
+        if not obj_id or obj_id.startswith("http") or obj_id.startswith("pfbid"):
+            return None  # URL resolver echoed the URL back — not a real node ID
+        return obj_id.split("_", 1)[1] if "_" in obj_id else obj_id
+
+    # Strategy 1: use pfbid string directly as a Graph API node ID
+    data = safe_api_call(
+        f"{BASE_URL}/{pfbid_str}",
+        {"fields": "id", "access_token": ACCESS_TOKEN},
+        "pfbid direct node lookup",
+    )
+    if data:
+        raw_id = _extract_raw_id(data.get("id", ""))
+        if raw_id:
+            print(f"  [pfbid] Resolved (direct lookup) -> post_id={raw_id}")
+            return raw_id
+
+    # Strategy 2: URL resolver (GET /?id={url}&fields=id)
+    data = safe_api_call(
+        BASE_URL,
+        {"id": url, "fields": "id", "access_token": ACCESS_TOKEN},
+        "pfbid URL resolver",
+    )
+    if data:
+        raw_id = _extract_raw_id(data.get("id", ""))
+        if raw_id:
+            print(f"  [pfbid] Resolved (URL resolver) -> post_id={raw_id}")
+            return raw_id
+
+    print(f"  [pfbid] Could not resolve to numeric ID — both strategies failed.")
+    return None
+
+
 def detect_post_type(url):
     """Detect content type from URL."""
     # Instagram URLs (handle both /reel/ and /reels/)
@@ -187,7 +240,11 @@ def extract_id_from_url(url, post_type):
     elif post_type == "post":
         match = re.search(r'/posts/(\w+)', url)
         if match:
-            return match.group(1)
+            extracted = match.group(1)
+            if extracted.startswith('pfbid'):
+                resolved = resolve_pfbid(url)
+                return resolved if resolved else extracted
+            return extracted
     elif post_type == "ig_reel":
         # Handle both /reel/ and /reels/
         match = re.search(r'instagram\.com/reels?/([A-Za-z0-9_-]+)', url)
@@ -530,6 +587,20 @@ def collect_video_insights(video_id, post_type):
         metrics.get("Shares", 0)
     )
 
+    # Flag for ad scan optimization: check multiple paid signals
+    # Reach-objective ads may NOT show in Views_Paid, so check broadly
+    paid_views = metrics.get("Views_Paid", 0)
+    paid_complete = metrics.get("Complete_Views_Paid", 0)
+    has_paid = (paid_views > 0) or (paid_complete > 0)
+    # Conservative: if paid metrics weren't fetched at all, assume ads may exist
+    if "Views_Paid" not in metrics:
+        has_paid = True  # couldn't check — scan to be safe
+    metrics["_has_paid_activity"] = has_paid
+    if has_paid:
+        print(f"  [i] Paid signal detected (Views_Paid={paid_views:,}, Complete_Paid={paid_complete:,}) — will scan for ads")
+    else:
+        print(f"  [i] No paid activity detected — ad scan will be skipped")
+
     return metrics, created_time, post_id
 
 
@@ -713,6 +784,31 @@ def collect_photo_post_insights(content_id, post_type):
 
     print(f"\n  Summary: Reach={metrics.get('Reach', 0):,} | Interactions={metrics['Interactions']:,} | Link Clicks={metrics.get('Link_Clicks', 0):,}")
 
+    # Flag for ad scan optimization: check if post has any paid views
+    # Try post_media_view with is_from_ads breakdown to detect paid activity
+    # Conservative: default to True (scan ads) if check is inconclusive
+    has_paid = True  # safe default
+    paid_check = safe_api_call(
+        f"{BASE_URL}/{post_id}/insights",
+        {"access_token": ACCESS_TOKEN, "metric": "post_media_view",
+         "period": "lifetime", "breakdown": "is_from_ads"},
+        "Paid activity check (post_media_view is_from_ads)"
+    )
+    if paid_check and "data" in paid_check and len(paid_check["data"]) > 0:
+        val = paid_check["data"][0]["values"][0]["value"]
+        if isinstance(val, dict):
+            paid_views = int(val.get("true", val.get("True", 0)) or 0)
+            has_paid = paid_views > 0
+            print(f"  [i] Paid views from breakdown: {paid_views:,}")
+        elif isinstance(val, (int, float)) and val == 0:
+            has_paid = False  # total views = 0 means no activity at all
+    # else: API call failed or unexpected format → keep has_paid=True (safe)
+    metrics["_has_paid_activity"] = has_paid
+    if has_paid:
+        print(f"  [i] Paid activity detected — will scan for ads")
+    else:
+        print(f"  [i] No paid views detected — ad scan will be skipped")
+
     return metrics, created_time, post_id
 
 
@@ -741,13 +837,16 @@ def resolve_instagram_business_account():
     return None
 
 
-def find_ig_media_by_shortcode(ig_user_id, shortcode):
+def find_ig_media_by_shortcode(ig_user_id, shortcode, hint_date=None):
     """Search media on the IG account to find the media ID matching a shortcode.
 
-    Workflow:
-    1. Fetch all media with {IG_BUSINESS_ID}/media?fields=shortcode,id&limit=300
-    2. Match shortcode from URL
-    3. Return matched media object
+    Fetches up to 300 most-recent media items in a single call.
+    The IG /media endpoint does not reliably support since/until filtering,
+    so we always use limit=300 without a date filter.
+
+    hint_date is kept as a parameter for API compatibility but is unused here.
+    If the post is not in the first 300 items, resolve_ig_media_via_url handles
+    the paginated fallback search.
 
     Uses IG token for this endpoint.
     """
@@ -756,10 +855,11 @@ def find_ig_media_by_shortcode(ig_user_id, shortcode):
     params = {
         "access_token": ig_token,
         "fields": "id,shortcode,media_type,timestamp,permalink",
-        "limit": 300,  # Fetch large batch for older posts
+        "limit": 300,
     }
 
     print(f"    Fetching media list (limit=300)...")
+
     data = safe_api_call(request_url, params, "IG Media Search")
 
     if not data or "data" not in data:
@@ -787,9 +887,9 @@ def find_ig_media_by_shortcode(ig_user_id, shortcode):
     return None
 
 
-def resolve_ig_media_via_url(ig_user_id, shortcode, post_type):
+def resolve_ig_media_via_url(ig_user_id, shortcode, post_type, hint_date=None):
     """Fallback: try to find IG media ID via the Instagram URL using oEmbed or
-    by fetching all media with a broader search."""
+    by paginating the media list with timestamp-based early stopping."""
     # Build the original Instagram URL
     if post_type == "ig_reel":
         ig_url = f"https://www.instagram.com/reel/{shortcode}/"
@@ -807,27 +907,55 @@ def resolve_ig_media_via_url(ig_user_id, shortcode, post_type):
     )
     if data:
         print(f"  oEmbed returned data (title: {data.get('title', 'N/A')[:50]})")
-        # oEmbed doesn't return the media ID directly, but confirms the post exists
 
-    # Try searching media with a broader time range or different fields
-    print(f"  [*] Trying broader media search with permalink matching...")
+    # Paginate through media WITHOUT since/until — the IG /media endpoint does not
+    # reliably support timestamp filtering and silently fails when those params are
+    # present. Instead, paginate page-by-page and stop early once timestamps go
+    # older than the earliest plausible publish date for this post.
+    stop_before_dt = datetime.now() - timedelta(days=730)  # 2-year hard cutoff
+    if hint_date:
+        try:
+            end_dt = datetime.strptime(hint_date, "%Y-%m-%d")
+            # Post must have been published before end_date; allow generous 18-month window
+            stop_before_dt = end_dt - timedelta(days=548)
+        except ValueError:
+            pass
+
+    print(f"  [*] Paginating media (early-stop before {stop_before_dt.date()}, max 20 pages)...")
     request_url = f"{BASE_URL}/{ig_user_id}/media"
     params = {
         "access_token": ig_token,
-        "fields": "id,shortcode,media_type,timestamp,permalink,media_url",
+        "fields": "id,shortcode,media_type,timestamp,permalink",
         "limit": 100,
     }
     page_num = 0
-    while request_url and page_num < 10:
+    while request_url and page_num < 20:
         page_num += 1
+        time.sleep(0.3)
         resp = safe_api_call(request_url, params, f"IG Broad Search (page {page_num})")
         if not resp or "data" not in resp:
             break
-        for media in resp["data"]:
-            permalink = media.get("permalink", "")
+        items = resp["data"]
+        print(f"    Page {page_num}: {len(items)} items", end="")
+        oldest_ts = items[-1].get("timestamp", "") if items else ""
+        print(f" | oldest: {oldest_ts[:10]}" if oldest_ts else "")
+        for media in items:
             sc = media.get("shortcode", "")
-            if shortcode in permalink or shortcode == sc:
+            permalink = media.get("permalink", "")
+            if sc == shortcode or shortcode in permalink:
+                print(f"  [*] Found via fallback on page {page_num}: id={media.get('id')}")
                 return media
+        # Early stop: if oldest item on this page is before our cutoff, give up
+        if oldest_ts:
+            try:
+                oldest_dt = datetime.fromisoformat(
+                    oldest_ts.replace("+0000", "+00:00").replace("Z", "+00:00")
+                ).replace(tzinfo=None)
+                if oldest_dt < stop_before_dt:
+                    print(f"  [*] Oldest item {oldest_dt.date()} < cutoff {stop_before_dt.date()}, stopping.")
+                    break
+            except (ValueError, AttributeError):
+                pass
         next_url = resp.get("paging", {}).get("next")
         if next_url:
             request_url = next_url
@@ -838,7 +966,7 @@ def resolve_ig_media_via_url(ig_user_id, shortcode, post_type):
     return None
 
 
-def collect_instagram_insights(shortcode, post_type):
+def collect_instagram_insights(shortcode, post_type, end_date=None):
     """Collect insights for an Instagram post or reel."""
     print("\n" + "=" * 60)
     print("COLLECTING INSTAGRAM INSIGHTS")
@@ -860,7 +988,7 @@ def collect_instagram_insights(shortcode, post_type):
 
     ig_token = get_ig_token()
 
-    # Verify IG insights permission
+    # Verify IG insights permission (non-blocking — warn but continue)
     print(f"  Checking instagram_manage_insights permission (using {'IG' if IG_ACCESS_TOKEN else 'FB'} token)...")
     perm_check = safe_api_call(
         f"{BASE_URL}/{ig_user_id}/insights",
@@ -868,23 +996,19 @@ def collect_instagram_insights(shortcode, post_type):
         "IG Permission Check"
     )
     if perm_check is None:
-        print("  [!] Token lacks instagram_manage_insights permission.")
-        print("  [!] Re-generate your access token with these permissions:")
-        print("      - instagram_basic")
-        print("      - instagram_manage_insights")
-        print("      - pages_read_engagement")
-        print("      - read_insights")
-        print("  [!] Skipping Instagram insights collection.")
-        return metrics, None, None, ig_user_id
+        print("  [!] WARNING: Permission check failed — this may indicate missing permissions")
+        print("      or a temporary API error. Proceeding with media search anyway...")
+        print("      If insights fail below, re-generate your token with:")
+        print("      - instagram_basic, instagram_manage_insights, pages_read_engagement, read_insights")
 
     # Step 2: Find media by shortcode
     print("\n[2/4] Searching for media by shortcode...")
-    media = find_ig_media_by_shortcode(ig_user_id, shortcode)
+    media = find_ig_media_by_shortcode(ig_user_id, shortcode, hint_date=end_date)
 
     # Fallback if shortcode search failed
     if not media:
         print(f"  [*] Primary search failed, trying fallback methods...")
-        media = resolve_ig_media_via_url(ig_user_id, shortcode, post_type)
+        media = resolve_ig_media_via_url(ig_user_id, shortcode, post_type, hint_date=end_date)
 
     if not media:
         print(f"  [!] Could not find media with shortcode '{shortcode}'.")
@@ -1026,6 +1150,7 @@ def _parse_ad_insights(ad):
     stats = {
         "campaign_name": ad.get("campaign", {}).get("name", "N/A"),
         "adset_name": ad.get("adset", {}).get("name", "N/A"),
+        "adset_start_time": ad.get("adset", {}).get("start_time", ""),
         "spend": 0.0, "currency": "HKD", "impressions": 0, "reach": 0,
         "frequency": 0.0, "link_clicks": 0, "clicks_all": 0, "post_engagement": 0,
         "reactions": 0, "comments": 0, "shares": 0, "saves": 0,
@@ -1033,6 +1158,7 @@ def _parse_ad_insights(ad):
     }
     insights = ad.get("insights", {}).get("data", [{}])[0]
     stats["currency"] = insights.get("account_currency", "HKD")
+    stats["date_start"] = insights.get("date_start", "")
 
     stats["spend"] = float(insights.get("spend", 0))
     stats["impressions"] = int(insights.get("impressions", 0))
@@ -1097,21 +1223,26 @@ def collect_ad_insights(video_id=None, time_range=None, post_id=None):
             f"insights.time_range({time_range_str})"
             "{spend,account_currency,impressions,reach,frequency,clicks,inline_link_clicks,"
             "inline_post_engagement,actions,"
-            "video_thruplay_watched_actions,video_p100_watched_actions}"
+            "video_thruplay_watched_actions,video_p100_watched_actions,date_start}"
         )
     else:
         insights_part = (
             "insights.date_preset(maximum)"
             "{spend,account_currency,impressions,reach,frequency,clicks,inline_link_clicks,"
             "inline_post_engagement,actions,"
-            "video_thruplay_watched_actions,video_p100_watched_actions}"
+            "video_thruplay_watched_actions,video_p100_watched_actions,date_start}"
         )
 
-    fields = f"campaign{{name}},adset{{name}},creative{{video_id,effective_object_story_id,object_story_id}},{insights_part}"
+    fields = f"campaign{{name}},adset{{name,start_time}},creative{{video_id,effective_object_story_id,object_story_id}},{insights_part}"
 
     LIMIT = 100
     request_url = f"{BASE_URL}/{AD_ACCOUNT_ID}/ads"
     params = {"access_token": ACCESS_TOKEN, "limit": LIMIT, "fields": fields}
+
+    # NOTE: Server-side filtering by effective_object_story_id is NOT supported
+    # by Meta's Ads API. We must scan all ads and match client-side.
+    # For IG posts, the faster boost_ads_list approach is used separately
+    # in collect_ig_ad_insights().
 
     all_matched = []
     page_num = 0
@@ -1300,8 +1431,19 @@ def collect_ig_ad_insights(ig_media_id=None, time_range=None):
         print("  [!] No boosted ads found for this media.")
         return None
 
-    ad_entries = boost_data["data"]
-    print(f"  Found {len(ad_entries)} ad(s):")
+    ad_entries_raw = boost_data["data"]
+    # Deduplicate by ad_id — boost_ads_list sometimes returns the same ad ID twice
+    seen_ids = set()
+    ad_entries = []
+    for entry in ad_entries_raw:
+        aid = entry.get("ad_id")
+        if aid and aid not in seen_ids:
+            seen_ids.add(aid)
+            ad_entries.append(entry)
+    if len(ad_entries) < len(ad_entries_raw):
+        print(f"  Found {len(ad_entries_raw)} ad(s) (deduplicated to {len(ad_entries)}):")
+    else:
+        print(f"  Found {len(ad_entries)} ad(s):")
     for entry in ad_entries:
         print(f"    - ad_id: {entry.get('ad_id')} | status: {entry.get('ad_status', 'unknown')}")
 
@@ -1375,7 +1517,7 @@ def collect_ig_ad_insights(ig_media_id=None, time_range=None):
     insight_fields = (
         "campaign_name,adset_name,spend,account_currency,impressions,reach,frequency,"
         "inline_link_clicks,clicks,inline_post_engagement,actions,"
-        "video_thruplay_watched_actions,video_p100_watched_actions"
+        "video_thruplay_watched_actions,video_p100_watched_actions,date_start"
     )
 
     for entry in ads_to_fetch:
@@ -1429,6 +1571,7 @@ def collect_ig_ad_insights(ig_media_id=None, time_range=None):
         stats = {
             "campaign_name": campaign_name,
             "adset_name": adset_name,
+            "date_start": row.get("date_start", ""),
             "spend": float(row.get("spend", 0)),
             "currency": currency,
             "impressions": int(row.get("impressions", 0)),
@@ -2131,7 +2274,7 @@ def process_single_url(url, end_date):
 
     # Instagram pipeline
     if post_type in ("ig_reel", "ig_post"):
-        post_metrics, created_time, ig_media_id, ig_user_id = collect_instagram_insights(content_id, post_type)
+        post_metrics, created_time, ig_media_id, ig_user_id = collect_instagram_insights(content_id, post_type, end_date=end_date)
 
         start_date = None
         if created_time:
@@ -2271,15 +2414,19 @@ def process_single_url(url, end_date):
     if start_date and end_date:
         time_range = {"since": start_date, "until": end_date}
 
-    # Collect ad insights - now supports all post types via post_id matching
+    # Collect ad insights - skip full scan if no paid activity detected
     ad_metrics = None
-    if AD_ACCOUNT_ID:
+    has_paid = post_metrics.get("_has_paid_activity", True)  # default True to be safe
+    if AD_ACCOUNT_ID and has_paid:
         ad_video_id = content_id if post_type in ("video", "reel") else None
         ad_metrics = collect_ad_insights(
             video_id=ad_video_id,
             time_range=time_range,
             post_id=post_id,
         )
+    elif AD_ACCOUNT_ID and not has_paid:
+        print(f"\n  [SKIP] No paid activity detected — skipping ad account scan")
+        print(f"         (This saves scanning {AD_ACCOUNT_ID} page by page)")
 
     print_report(post_metrics, ad_metrics)
 

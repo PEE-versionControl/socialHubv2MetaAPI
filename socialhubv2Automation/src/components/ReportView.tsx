@@ -1,9 +1,9 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Play, StopCircle, Download, FileText, Link2, Calendar, ToggleLeft, ToggleRight, Loader2, AlertTriangle, CheckCircle2, Clock, ExternalLink, Save, FileDown, CheckSquare, Square, X } from 'lucide-react';
+import { Play, StopCircle, Download, FileText, Link2, Calendar, ToggleLeft, ToggleRight, Loader2, AlertTriangle, CheckCircle2, Clock, ExternalLink, Save, FileDown, CheckSquare, Square, X, FileSpreadsheet } from 'lucide-react';
 import { collection, doc, writeBatch, serverTimestamp, Timestamp } from 'firebase/firestore';
 import { signInAnonymously } from 'firebase/auth';
 import { db, appId, auth } from '../config/firebase';
-import { checkHealth, submitUrlReport, submitMonthReport, getJobStatus, cancelJob, fetchAccounts } from '../utils/api';
+import { checkHealth, submitUrlReport, submitMonthReport, getJobStatus, cancelJob, fetchAccounts, downloadExcelReport } from '../utils/api';
 import type { JobStatus, ReportResult, Account } from '../utils/api';
 import type { Post } from '../types';
 import { autoCategorize } from '../utils/helpers';
@@ -85,6 +85,7 @@ export default function ReportView({ existingPosts }: Props) {
   const [jobStatus, setJobStatus] = useState<JobStatus | null>(_saved?.jobStatus ?? null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
+  const [isDownloadingExcel, setIsDownloadingExcel] = useState(false);
   const [saveResult, setSaveResult] = useState<{ created: number; updated: number } | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -339,6 +340,21 @@ export default function ReportView({ existingPosts }: Props) {
     setIsSaving(false);
   };
 
+  const handleDownloadExcel = async () => {
+    if (!jobId || isDownloadingExcel) return;
+    setIsDownloadingExcel(true);
+    try {
+      await downloadExcelReport(jobId);
+    } catch (e: any) {
+      alert(`Excel download failed: ${e.message}`);
+    } finally {
+      setIsDownloadingExcel(false);
+    }
+  };
+
+  // True whenever any async action is in flight — disables all action buttons to prevent double-clicks
+  const isAnyBusy = isSaving || isDownloadingExcel;
+
   const isRunning = jobStatus?.status === 'running';
   const isCompleted = jobStatus?.status === 'completed';
   const progress = jobStatus ? jobStatus.progress : 0;
@@ -541,27 +557,38 @@ export default function ReportView({ existingPosts }: Props) {
             <div className="flex gap-2 flex-wrap">
               <button
                 onClick={handleSaveToSocialHub}
-                disabled={isSaving}
-                className="px-4 py-2 bg-indigo-50 text-indigo-700 rounded-lg text-sm font-medium hover:bg-indigo-100 flex items-center gap-2 transition-colors disabled:opacity-50"
+                disabled={isAnyBusy}
+                className="px-4 py-2 bg-indigo-50 text-indigo-700 rounded-lg text-sm font-medium hover:bg-indigo-100 flex items-center gap-2 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 {isSaving ? <Loader2 size={16} className="animate-spin" /> : <Save size={16} />}
                 Save to Social Hub
               </button>
               <button
                 onClick={handleDownloadAllPerPost}
-                className="px-4 py-2 bg-amber-50 text-amber-700 rounded-lg text-sm font-medium hover:bg-amber-100 flex items-center gap-2 transition-colors"
+                disabled={isAnyBusy}
+                className="px-4 py-2 bg-amber-50 text-amber-700 rounded-lg text-sm font-medium hover:bg-amber-100 flex items-center gap-2 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 <FileDown size={16} /> Per-Post CSVs
               </button>
               <button
                 onClick={handleDownloadAll}
-                className="px-4 py-2 bg-green-50 text-green-700 rounded-lg text-sm font-medium hover:bg-green-100 flex items-center gap-2 transition-colors"
+                disabled={isAnyBusy}
+                className="px-4 py-2 bg-green-50 text-green-700 rounded-lg text-sm font-medium hover:bg-green-100 flex items-center gap-2 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 <Download size={16} /> Combined CSV
               </button>
               <button
+                onClick={handleDownloadExcel}
+                disabled={isAnyBusy}
+                className="px-4 py-2 bg-emerald-50 text-emerald-700 rounded-lg text-sm font-medium hover:bg-emerald-100 flex items-center gap-2 transition-colors border border-emerald-200 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {isDownloadingExcel ? <Loader2 size={16} className="animate-spin" /> : <FileSpreadsheet size={16} />}
+                {isDownloadingExcel ? 'Preparing...' : 'Combined Excel'}
+              </button>
+              <button
                 onClick={() => { setJobId(null); setJobStatus(null); setSaveResult(null); sessionStorage.removeItem(SESSION_KEY); }}
-                className="px-4 py-2 bg-red-50 text-red-600 rounded-lg text-sm font-medium hover:bg-red-100 flex items-center gap-2 transition-colors"
+                disabled={isAnyBusy}
+                className="px-4 py-2 bg-red-50 text-red-600 rounded-lg text-sm font-medium hover:bg-red-100 flex items-center gap-2 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                 title="Clear results and start fresh"
               >
                 <X size={16} /> Clear
@@ -630,13 +657,25 @@ export default function ReportView({ existingPosts }: Props) {
                       <td className="px-4 py-3 text-right font-mono text-indigo-600">{r.live_shares != null ? r.live_shares.toLocaleString() : '—'}</td>
                     </>}
                     <td className="px-4 py-3">
-                      <button
-                        onClick={() => handleDownloadPost(r)}
-                        className="text-gray-400 hover:text-indigo-600 transition-colors"
-                        title="Download per-post CSV"
-                      >
-                        <FileDown size={14} />
-                      </button>
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={() => handleDownloadPost(r)}
+                          disabled={isAnyBusy}
+                          className="text-gray-400 hover:text-indigo-600 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                          title="Download per-post CSV"
+                        >
+                          <FileDown size={14} />
+                        </button>
+                        <button
+                          onClick={handleDownloadExcel}
+                          disabled={isAnyBusy}
+                          className="flex items-center gap-1 px-2 py-0.5 rounded text-xs font-medium bg-green-50 text-green-700 border border-green-200 hover:bg-green-100 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                          title="Download combined Excel report (.xlsx)"
+                        >
+                          {isDownloadingExcel ? <Loader2 size={12} className="animate-spin" /> : <FileSpreadsheet size={12} />}
+                          <span>{isDownloadingExcel ? '...' : 'Excel'}</span>
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 ))}

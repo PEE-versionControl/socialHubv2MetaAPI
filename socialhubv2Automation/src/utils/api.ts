@@ -128,3 +128,19 @@ export async function getJobStatus(job_id: string): Promise<JobStatus> {
 export async function cancelJob(job_id: string): Promise<void> {
   await fetch(`${API_BASE}/api/report/cancel/${job_id}`, { method: 'POST' });
 }
+
+export async function downloadExcelReport(job_id: string): Promise<void> {
+  const res = await fetch(`${API_BASE}/api/report/excel/${job_id}`);
+  if (!res.ok) throw new Error(`Download failed: ${res.statusText}`);
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  const cd = res.headers.get('content-disposition');
+  const match = cd?.match(/filename[^;=\n]*=['"]?([^'";\n]+)/i);
+  a.download = match?.[1] || `report_${job_id}.xlsx`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
