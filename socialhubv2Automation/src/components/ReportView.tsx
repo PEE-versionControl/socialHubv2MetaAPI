@@ -563,6 +563,7 @@ export default function ReportView({ existingPosts }: Props) {
                 {isSaving ? <Loader2 size={16} className="animate-spin" /> : <Save size={16} />}
                 Save to Social Hub
               </button>
+              {/* Per-Post CSVs and Combined CSV buttons hidden per user request
               <button
                 onClick={handleDownloadAllPerPost}
                 disabled={isAnyBusy}
@@ -577,6 +578,7 @@ export default function ReportView({ existingPosts }: Props) {
               >
                 <Download size={16} /> Combined CSV
               </button>
+              */}
               <button
                 onClick={handleDownloadExcel}
                 disabled={isAnyBusy}
@@ -658,6 +660,7 @@ export default function ReportView({ existingPosts }: Props) {
                     </>}
                     <td className="px-4 py-3">
                       <div className="flex items-center gap-2">
+                        {/* Per-post CSV icon hidden per user request
                         <button
                           onClick={() => handleDownloadPost(r)}
                           disabled={isAnyBusy}
@@ -666,6 +669,7 @@ export default function ReportView({ existingPosts }: Props) {
                         >
                           <FileDown size={14} />
                         </button>
+                        */}
                         <button
                           onClick={handleDownloadExcel}
                           disabled={isAnyBusy}
