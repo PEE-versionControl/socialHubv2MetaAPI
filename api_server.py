@@ -26,8 +26,7 @@ from urllib.parse import quote as _url_quote
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import Response, JSONResponse
 from pydantic import BaseModel
 
 # Import from existing scripts
@@ -45,14 +44,39 @@ from excel_report import generate_excel_report, generate_excel_report_combined
 
 app = FastAPI(title="Social Hub Report API", version="1.0.0")
 
+ALLOWED_ORIGINS = os.environ.get(
+    "ALLOWED_ORIGINS", "http://localhost:5173,http://localhost:8000"
+).split(",")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows tunnel URLs (ngrok, cloudflare) and localhost dev
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["Content-Disposition"],
 )
+
+
+# --- API Key Authentication ---
+API_KEY = os.environ.get("API_KEY", "")
+
+
+@app.middleware("http")
+async def check_api_key(request, call_next):
+    """Reject unauthenticated requests to /api/ routes (except health and OPTIONS)."""
+    # Always let CORS preflight through — browsers send no custom headers on OPTIONS
+    if request.method == "OPTIONS":
+        return await call_next(request)
+    # Skip auth for health check
+    if not request.url.path.startswith("/api/") or request.url.path == "/api/health":
+        return await call_next(request)
+    # Skip if no API_KEY configured (local dev)
+    if not API_KEY:
+        return await call_next(request)
+    if request.headers.get("X-API-Key") != API_KEY:
+        return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+    return await call_next(request)
 
 
 # In-memory job store
@@ -447,6 +471,18 @@ def get_report_status(job_id: str):
         raise HTTPException(status_code=404, detail="Job not found")
 
     job = task_store[job_id]
+
+    # Compute elapsed time from created_at
+    elapsed_seconds = None
+    created_at = job.get("created_at")
+    if created_at:
+        try:
+            start = datetime.fromisoformat(created_at)
+            end = datetime.fromisoformat(job["completed_at"]) if job.get("completed_at") else datetime.now()
+            elapsed_seconds = int((end - start).total_seconds())
+        except (ValueError, TypeError):
+            pass
+
     return {
         "job_id": job_id,
         "status": job["status"],
@@ -458,6 +494,7 @@ def get_report_status(job_id: str):
         "live_fetch_paused": job.get("live_fetch_paused", False),
         "status_detail": job.get("status_detail", ""),
         "completed_at": job.get("completed_at"),
+        "elapsed_seconds": elapsed_seconds,
     }
 
 
@@ -588,35 +625,8 @@ def download_excel_report(job_id: str, result_index: int):
     )
 
 
-# --- Static File Serving (Demo / Remote Access Mode) ---
-# Serves the built React app so the whole project runs on one port (8000).
-# This lets you expose a single tunnel URL to a remote client.
-#
-# Steps to enable:
-#   1. cd socialhubv2Automation && npm run build
-#   2. uvicorn api_server:app --host 0.0.0.0 --port 8000
-#   3. Expose with:  ngrok http 8000   OR   cloudflared tunnel --url http://localhost:8000
-#   4. Share the public URL with the client — no other steps needed.
-#
-# Priority: dist/ inside the frontend project dir > static/ (legacy copy)
 
-_BASE = os.path.dirname(os.path.abspath(__file__))
-_DIST = os.path.join(_BASE, "socialhubv2Automation", "dist")
-_STATIC_LEGACY = os.path.join(_BASE, "static")
-STATIC_DIR = _DIST if os.path.isdir(_DIST) else (_STATIC_LEGACY if os.path.isdir(_STATIC_LEGACY) else None)
-
-if STATIC_DIR:
-    # Serve static assets (JS, CSS, images, fonts)
-    _assets = os.path.join(STATIC_DIR, "assets")
-    if os.path.isdir(_assets):
-        app.mount("/assets", StaticFiles(directory=_assets), name="assets")
-
-    # Catch-all: serve index.html for any non-API route (React SPA routing)
-    @app.get("/{full_path:path}")
-    async def serve_spa(full_path: str):
-        if full_path.startswith("api/"):
-            raise HTTPException(status_code=404)
-        file_path = os.path.join(STATIC_DIR, full_path)
-        if os.path.isfile(file_path):
-            return FileResponse(file_path)
-        return FileResponse(os.path.join(STATIC_DIR, "index.html"))
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)

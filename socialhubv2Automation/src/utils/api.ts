@@ -1,6 +1,14 @@
-// In dev mode (Vite on :5173), API is on :8000.
-// In production (single-process), API is same origin.
-const API_BASE = import.meta.env.DEV ? 'http://localhost:8000' : '';
+// In production, VITE_API_BASE_URL points to the Railway backend.
+// In dev mode (Vite on :5173), falls through to localhost:8000.
+const API_BASE = import.meta.env.VITE_API_BASE_URL || (import.meta.env.DEV ? 'http://localhost:8000' : '');
+
+const API_KEY = import.meta.env.VITE_API_KEY || '';
+
+function apiHeaders(extra?: Record<string, string>): Record<string, string> {
+  const h: Record<string, string> = { ...extra };
+  if (API_KEY) h['X-API-Key'] = API_KEY;
+  return h;
+}
 
 export interface ReportUrlEntry {
   url: string;
@@ -88,13 +96,13 @@ export interface Account {
 }
 
 export async function checkHealth(): Promise<{ status: string; fb_token: boolean; ig_token: boolean }> {
-  const res = await fetch(`${API_BASE}/api/health`);
+  const res = await fetch(`${API_BASE}/api/health`, { headers: apiHeaders() });
   if (!res.ok) throw new Error('Backend unavailable');
   return res.json();
 }
 
 export async function fetchAccounts(): Promise<Account[]> {
-  const res = await fetch(`${API_BASE}/api/accounts`);
+  const res = await fetch(`${API_BASE}/api/accounts`, { headers: apiHeaders() });
   if (!res.ok) throw new Error('Failed to fetch accounts');
   return res.json();
 }
@@ -102,7 +110,7 @@ export async function fetchAccounts(): Promise<Account[]> {
 export async function submitUrlReport(urls: ReportUrlEntry[], include_live: boolean): Promise<{ job_id: string }> {
   const res = await fetch(`${API_BASE}/api/report/by-urls`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: apiHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ urls, include_live }),
   });
   if (!res.ok) throw new Error(`Failed: ${res.statusText}`);
@@ -112,7 +120,7 @@ export async function submitUrlReport(urls: ReportUrlEntry[], include_live: bool
 export async function submitMonthReport(year_month: string, include_live: boolean, account_keys?: string[]): Promise<{ job_id: string }> {
   const res = await fetch(`${API_BASE}/api/report/by-month`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: apiHeaders({ 'Content-Type': 'application/json' }),
     body: JSON.stringify({ year_month, include_live, account_keys: account_keys || [] }),
   });
   if (!res.ok) throw new Error(`Failed: ${res.statusText}`);
@@ -120,17 +128,17 @@ export async function submitMonthReport(year_month: string, include_live: boolea
 }
 
 export async function getJobStatus(job_id: string): Promise<JobStatus> {
-  const res = await fetch(`${API_BASE}/api/report/status/${job_id}`);
+  const res = await fetch(`${API_BASE}/api/report/status/${job_id}`, { headers: apiHeaders() });
   if (!res.ok) throw new Error(`Failed: ${res.statusText}`);
   return res.json();
 }
 
 export async function cancelJob(job_id: string): Promise<void> {
-  await fetch(`${API_BASE}/api/report/cancel/${job_id}`, { method: 'POST' });
+  await fetch(`${API_BASE}/api/report/cancel/${job_id}`, { method: 'POST', headers: apiHeaders() });
 }
 
 export async function downloadExcelReport(job_id: string): Promise<void> {
-  const res = await fetch(`${API_BASE}/api/report/excel/${job_id}`);
+  const res = await fetch(`${API_BASE}/api/report/excel/${job_id}`, { headers: apiHeaders() });
   if (!res.ok) throw new Error(`Download failed: ${res.statusText}`);
   const blob = await res.blob();
   const url = URL.createObjectURL(blob);

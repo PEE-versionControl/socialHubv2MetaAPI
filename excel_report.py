@@ -446,6 +446,33 @@ def _fill_image(img_bytes: bytes, target_w: int, target_h: int) -> tuple[bytes, 
         return img_bytes, target_w, target_h
 
 
+def _fit_image(img_bytes: bytes, max_w: int, max_h: int) -> tuple[bytes, int, int]:
+    """Resize image to fit within max_w × max_h, preserving aspect ratio.
+
+    Scales down proportionally so the full image is visible (no cropping).
+    Uses high-quality LANCZOS resampling for a clean result.
+    Returns (processed_bytes, actual_w, actual_h).
+    """
+    if _PILImage is None:
+        return img_bytes, max_w, max_h
+    try:
+        pil = _PILImage.open(BytesIO(img_bytes)).convert("RGB")
+        orig_w, orig_h = pil.size
+        scale = min(max_w / orig_w, max_h / orig_h)
+        new_w, new_h = int(orig_w * scale), int(orig_h * scale)
+        try:
+            resample = _PILImage.Resampling.LANCZOS
+        except AttributeError:
+            resample = _PILImage.LANCZOS
+        pil = pil.resize((new_w, new_h), resample)
+        out = BytesIO()
+        pil.save(out, format="PNG")
+        out.seek(0)
+        return out.read(), new_w, new_h
+    except Exception:
+        return img_bytes, max_w, max_h
+
+
 # ── Cell writers ──────────────────────────────────────────────────
 
 def _write_section_title(ws, row: int, text: str):
@@ -559,11 +586,11 @@ def generate_excel_report(
     )
     if img_bytes:
         try:
-            filled, iw, ih = _fill_image(img_bytes, 369, 491)
-            xl_img = XLImage(BytesIO(filled))
+            fitted, iw, ih = _fit_image(img_bytes, 369, 491)
+            xl_img = XLImage(BytesIO(fitted))
             xl_img.width, xl_img.height = iw, ih
             ws.add_image(xl_img, "C9")
-        except Exception:
+        except Exception:   
             ws.cell(row=9, column=3, value="[Image could not be embedded]")
     else:
         cell = ws.cell(row=9, column=3, value="[Paste screenshot here]")
@@ -826,8 +853,8 @@ def generate_excel_report_combined(
                                   page_id=page_id, ig_user_id=ig_user_id)
         if fb_img:
             try:
-                filled, iw, ih = _fill_image(fb_img, 300, 491)
-                xl = XLImage(BytesIO(filled))
+                fitted, iw, ih = _fit_image(fb_img, 369, 491)
+                xl = XLImage(BytesIO(fitted))
                 xl.width, xl.height = iw, ih
                 ws.add_image(xl, "C9")
             except Exception:
@@ -841,8 +868,8 @@ def generate_excel_report_combined(
                                   page_id=page_id, ig_user_id=ig_user_id)
         if ig_img:
             try:
-                filled, iw, ih = _fill_image(ig_img, 300, 491)
-                xl = XLImage(BytesIO(filled))
+                fitted, iw, ih = _fit_image(ig_img, 369, 491)
+                xl = XLImage(BytesIO(fitted))
                 xl.width, xl.height = iw, ih
                 ws.add_image(xl, "H9")
             except Exception:

@@ -87,11 +87,13 @@ def resolve_pfbid(url):
             return None  # URL resolver echoed the URL back — not a real node ID
         return obj_id.split("_", 1)[1] if "_" in obj_id else obj_id
 
-    # Strategy 1: use pfbid string directly as a Graph API node ID
+    # Strategy 1: use {PAGE_ID}_{pfbid} as a composite Graph API node ID
+    # (bare pfbid without PAGE_ID prefix fails with #12 deprecated)
+    composite_pfbid = f"{PAGE_ID}_{pfbid_str}"
     data = safe_api_call(
-        f"{BASE_URL}/{pfbid_str}",
+        f"{BASE_URL}/{composite_pfbid}",
         {"fields": "id", "access_token": ACCESS_TOKEN},
-        "pfbid direct node lookup",
+        "pfbid composite node lookup",
     )
     if data:
         raw_id = _extract_raw_id(data.get("id", ""))
@@ -127,7 +129,7 @@ def detect_post_type(url):
         return "video"
     elif re.search(r'/reel/(\d+)', url):
         return "reel"
-    elif re.search(r'/photos/', url):
+    elif re.search(r'/photos?/', url) or re.search(r'[?&]fbid=\d+', url):
         return "photo"
     elif re.search(r'/posts/', url):
         return "post"
@@ -231,6 +233,10 @@ def extract_id_from_url(url, post_type):
             if match:
                 return match.group(1)
     elif post_type == "photo":
+        # Check ?fbid= query parameter first (e.g., /photo/?fbid=123456)
+        match = re.search(r'[?&]fbid=(\d+)', url)
+        if match:
+            return match.group(1)
         match = re.search(r'/photos/[^/]+/(\d+)', url)
         if match:
             return match.group(1)
@@ -1193,14 +1199,14 @@ def _parse_ad_insights(ad):
 
 
 def collect_ad_insights(video_id=None, time_range=None, post_id=None):
-    """Collect Ad Manager insights for ALL ads matching the given video_id or post_id.
+    """Collect Ad Manager insights for ads matching the given video_id or post_id.
 
     Returns a list of stats dicts (one per matching ad), or None if no matches.
 
-    Scans ads page by page. Uses early termination: if a page returns fewer
-    ads than the requested limit, it's the last page — no need to paginate further.
-    Also stops paginating once matches are found and the current page has no new matches
-    (all matching ads are typically grouped together).
+    Strategy 1 (fast): Try server-side filtering by effective_object_story_id
+                       — single API call, no pagination needed.
+    Strategy 2 (fallback): Scan ads page by page with client-side matching.
+                           Uses limit=200 and early termination to minimize calls.
     """
     print("\n" + "=" * 60)
     print("COLLECTING AD MANAGER INSIGHTS")
@@ -1235,14 +1241,52 @@ def collect_ad_insights(video_id=None, time_range=None, post_id=None):
 
     fields = f"campaign{{name}},adset{{name,start_time}},creative{{video_id,effective_object_story_id,object_story_id}},{insights_part}"
 
-    LIMIT = 100
+    # ── Strategy 1: Server-side filtering (1 API call) ──
+    # Try filtering by effective_object_story_id or video_id directly
+    filter_field = None
+    filter_value = None
+    if post_id:
+        filter_field = "effective_object_story_id"
+        filter_value = post_id
+    elif video_id:
+        filter_field = "creative.video_id"
+        filter_value = video_id
+
+    if filter_field:
+        print(f"  [Strategy 1] Trying server-side filter: {filter_field}={filter_value}")
+        filtering = json.dumps([{"field": filter_field, "operator": "EQUAL", "value": filter_value}])
+        time.sleep(0.5)
+        try:
+            resp = requests.get(
+                f"{BASE_URL}/{AD_ACCOUNT_ID}/ads",
+                params={"access_token": ACCESS_TOKEN, "limit": 200, "fields": fields, "filtering": filtering},
+                timeout=30,
+            )
+            data = resp.json()
+            if "error" not in data:
+                filtered_ads = data.get("data", [])
+                if filtered_ads:
+                    all_matched = []
+                    for ad in filtered_ads:
+                        stats = _parse_ad_insights(ad)
+                        all_matched.append(stats)
+                        print(f"    [{len(all_matched)}] Matched (filtered): "
+                              f"{stats['campaign_name']} | Spend=${stats['spend']:.2f} | "
+                              f"Reach={stats['reach']:,}")
+                    print(f"\n  Total matched ads: {len(all_matched)} (server-side filter, 1 API call)")
+                    return all_matched
+                else:
+                    print(f"  [Strategy 1] No results from server-side filter")
+            else:
+                print(f"  [Strategy 1] Filter not supported: {data['error'].get('message', '')[:80]}")
+        except requests.RequestException as e:
+            print(f"  [Strategy 1] Request failed: {e}")
+
+    # ── Strategy 2: Paginated scan with client-side matching ──
+    print(f"  [Strategy 2] Scanning ads with client-side matching (limit=200)...")
+    LIMIT = 200
     request_url = f"{BASE_URL}/{AD_ACCOUNT_ID}/ads"
     params = {"access_token": ACCESS_TOKEN, "limit": LIMIT, "fields": fields}
-
-    # NOTE: Server-side filtering by effective_object_story_id is NOT supported
-    # by Meta's Ads API. We must scan all ads and match client-side.
-    # For IG posts, the faster boost_ads_list approach is used separately
-    # in collect_ig_ad_insights().
 
     all_matched = []
     page_num = 0
@@ -1306,7 +1350,7 @@ def collect_ad_insights(video_id=None, time_range=None, post_id=None):
             break
 
     if all_matched:
-        print(f"\n  Total matched ads: {len(all_matched)}")
+        print(f"\n  Total matched ads: {len(all_matched)} (scanned {page_num} page(s))")
     else:
         print(f"  [!] No matching ad found (searched {page_num} page(s)).")
         return None
