@@ -1,57 +1,25 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { Play, StopCircle, Download, FileText, Link2, Calendar, ToggleLeft, ToggleRight, Loader2, AlertTriangle, CheckCircle2, Clock, ExternalLink, Save, FileDown, CheckSquare, Square, X, FileSpreadsheet } from 'lucide-react';
+import { Play, StopCircle, FileText, Link2, Calendar, ToggleLeft, ToggleRight, Loader2, AlertTriangle, CheckCircle2, Clock, ExternalLink, Save, CheckSquare, Square, X, FileSpreadsheet } from 'lucide-react';
 import { collection, doc, writeBatch, serverTimestamp, Timestamp } from 'firebase/firestore';
 import { signInAnonymously } from 'firebase/auth';
 import { db, appId, auth } from '../config/firebase';
 import { checkHealth, submitUrlReport, submitMonthReport, getJobStatus, cancelJob, fetchAccounts, downloadExcelReport } from '../utils/api';
-import type { JobStatus, ReportResult, Account } from '../utils/api';
+import type { JobStatus, Account } from '../utils/api';
 import type { Post } from '../types';
 import { autoCategorize } from '../utils/helpers';
 
 type InputMode = 'urls' | 'month';
 
-const POST_HEADERS = ['Platform', 'Post Link', 'Date Range', 'Views', 'Reach', 'Interactions', 'Likes and reactions', 'Comments', 'Shares', 'Saves', 'Link clicks'];
-const AD_HEADERS = ['Campaign Name', 'Ad Set Name', 'Date Range', 'Amount spent', 'Impression', 'Reach', 'Frequency', 'Link Clicks', 'Click(All)', 'Post engagement', 'Post reactions', 'Post comments', 'Post shares', 'Post saves', 'ThruPlays', 'Video plays at 100%'];
+// const POST_HEADERS = ['Platform', 'Post Link', 'Date Range', 'Views', 'Reach', 'Interactions', 'Likes and reactions', 'Comments', 'Shares', 'Saves', 'Link clicks'];
+// const AD_HEADERS = ['Campaign Name', 'Ad Set Name', 'Date Range', 'Amount spent', 'Impression', 'Reach', 'Frequency', 'Link Clicks', 'Click(All)', 'Post engagement', 'Post reactions', 'Post comments', 'Post shares', 'Post saves', 'ThruPlays', 'Video plays at 100%'];
 
-function extractId(url: string): string {
-  const m = url.match(/\/(?:p|reels?|videos|posts)\/([^/?#&]+)/);
-  return m ? m[1] : 'unknown';
-}
-
-function generatePerPostCsv(r: ReportResult): string {
-  const lines: string[] = [];
-  const esc = (v: any) => {
-    const s = String(v ?? '');
-    return s.includes(',') || s.includes('"') ? `"${s.replace(/"/g, '""')}"` : s;
-  };
-
-  // Post Insight block
-  lines.push(POST_HEADERS.map(esc).join(','));
-  lines.push([r.platform, r.url, r.date_range, r.views, r.reach, r.interactions, r.reactions, r.comments, r.shares, r.saves, r.link_clicks].map(esc).join(','));
-  lines.push('');
-
-  // Ad Manager block
-  lines.push(AD_HEADERS.map(esc).join(','));
-  if (r.ad_metrics && r.ad_metrics.length > 0) {
-    for (const am of r.ad_metrics) {
-      lines.push([am.campaign_name, am.adset_name, r.date_range, am.spend.toFixed(2), am.impressions, am.reach, am.frequency.toFixed(2), am.link_clicks, am.clicks_all, am.post_engagement, am.reactions, am.comments, am.shares, am.saves, am.thruplays, am.video_100].map(esc).join(','));
-    }
-  } else {
-    lines.push(['No ad data', ...Array(15).fill('')].join(','));
-  }
-
-  return lines.join('\n');
-}
-
-function downloadCsv(content: string, filename: string) {
-  const blob = new Blob([content], { type: 'text/csv;charset=utf-8;' });
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = filename;
-  a.click();
-  URL.revokeObjectURL(url);
-}
+// CSV helper functions — disabled per user request, kept for future use
+// function extractId(url: string): string {
+//   const m = url.match(/\/(?:p|reels?|videos|posts)\/([^/?#&]+)/);
+//   return m ? m[1] : 'unknown';
+// }
+// function generatePerPostCsv(r: ReportResult): string { ... }
+// function downloadCsv(content: string, filename: string) { ... }
 
 interface Props {
   existingPosts: Post[];
@@ -207,29 +175,23 @@ export default function ReportView({ existingPosts }: Props) {
     }
   };
 
-  // Download all results as a single combined CSV (organic + ad blocks per post)
-  const handleDownloadAll = () => {
-    if (!jobStatus?.results?.length) return;
-    const csv = jobStatus.results.map(r => generatePerPostCsv(r)).join('\n\n');
-    downloadCsv(csv, `report_combined_${new Date().toISOString().slice(0, 10)}.csv`);
-  };
-
-  // Download per-post CSV (with ad metrics)
-  const handleDownloadPost = (r: ReportResult) => {
-    const prefix = r.platform === 'Instagram' ? 'IG' : 'FB';
-    const contentId = extractId(r.url);
-    const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, '');
-    const filename = `report_${prefix}_${contentId}_${dateStr}.csv`;
-    downloadCsv(generatePerPostCsv(r), filename);
-  };
-
-  // Download all per-post CSVs as individual files
-  const handleDownloadAllPerPost = () => {
-    if (!jobStatus?.results?.length) return;
-    for (const r of jobStatus.results) {
-      handleDownloadPost(r);
-    }
-  };
+  // CSV download handlers — disabled per user request, kept for future use
+  // const handleDownloadAll = () => {
+  //   if (!jobStatus?.results?.length) return;
+  //   const csv = jobStatus.results.map(r => generatePerPostCsv(r)).join('\n\n');
+  //   downloadCsv(csv, `report_combined_${new Date().toISOString().slice(0, 10)}.csv`);
+  // };
+  // const handleDownloadPost = (r: ReportResult) => {
+  //   const prefix = r.platform === 'Instagram' ? 'IG' : 'FB';
+  //   const contentId = extractId(r.url);
+  //   const dateStr = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+  //   const filename = `report_${prefix}_${contentId}_${dateStr}.csv`;
+  //   downloadCsv(generatePerPostCsv(r), filename);
+  // };
+  // const handleDownloadAllPerPost = () => {
+  //   if (!jobStatus?.results?.length) return;
+  //   for (const r of jobStatus.results) handleDownloadPost(r);
+  // };
 
   // Save to Social Hub (Firestore) — smart merge by URL
   const handleSaveToSocialHub = async () => {
