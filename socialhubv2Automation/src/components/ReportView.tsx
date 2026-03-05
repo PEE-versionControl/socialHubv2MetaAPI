@@ -48,6 +48,7 @@ export default function ReportView({ existingPosts }: Props) {
 
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [selectedAccounts, setSelectedAccounts] = useState<string[]>([]);
+  const [selectedUrlAccount, setSelectedUrlAccount] = useState<string>('');
 
   const [jobId, setJobId] = useState<string | null>(_saved?.jobId ?? null);
   const [jobStatus, setJobStatus] = useState<JobStatus | null>(_saved?.jobStatus ?? null);
@@ -88,8 +89,10 @@ export default function ReportView({ existingPosts }: Props) {
         const accts = await fetchAccounts();
         if (mounted) {
           setAccounts(accts);
-          // Select all accounts by default
+          // Select all accounts by default for monthly mode
           setSelectedAccounts(accts.map(a => a.key));
+          // Select first account for URL mode
+          if (accts.length > 0) setSelectedUrlAccount(accts[0].key);
         }
       } catch (e) {
         console.error('Failed to load accounts:', e);
@@ -144,7 +147,7 @@ export default function ReportView({ existingPosts }: Props) {
       if (inputMode === 'urls') {
         const urls = parseUrls();
         if (!urls.length) { alert('Please enter at least one URL.'); setIsSubmitting(false); return; }
-        response = await submitUrlReport(urls, includeLive);
+        response = await submitUrlReport(urls, includeLive, selectedUrlAccount);
       } else {
         if (!yearMonth) { alert('Please select a month.'); setIsSubmitting(false); return; }
         if (selectedAccounts.length === 0) { alert('Please select at least one account.'); setIsSubmitting(false); return; }
@@ -370,6 +373,20 @@ export default function ReportView({ existingPosts }: Props) {
               className="w-full border border-gray-200 rounded-lg p-3 text-sm font-mono focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none resize-y"
             />
             <p className="text-xs text-gray-400 mt-1">{parseUrls().length} URL(s) detected</p>
+            {accounts.length > 1 && (
+              <div className="mt-2">
+                <label className="text-xs text-gray-500 mb-1 block">Account</label>
+                <select
+                  value={selectedUrlAccount}
+                  onChange={e => setSelectedUrlAccount(e.target.value)}
+                  className="border border-gray-200 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none"
+                >
+                  {accounts.map(a => (
+                    <option key={a.key} value={a.key}>{a.name}</option>
+                  ))}
+                </select>
+              </div>
+            )}
           </div>
         ) : (
           <div className="space-y-3">

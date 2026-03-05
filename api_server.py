@@ -155,6 +155,7 @@ def _swap_account(account_key: str):
 class UrlReportRequest(BaseModel):
     urls: list[dict]  # [{"url": "...", "end_date": "YYYY-MM-DD"}, ...]
     include_live: bool = False
+    account_key: str = ""  # Which account to use (empty = default)
 
 class MonthReportRequest(BaseModel):
     year_month: str  # "YYYY-MM"
@@ -415,6 +416,15 @@ def list_accounts():
 def create_url_report(req: UrlReportRequest):
     if not req.urls:
         raise HTTPException(status_code=400, detail="No URLs provided")
+
+    # Swap account if specified
+    account_key = req.account_key
+    if account_key and account_key in ACCOUNTS:
+        _swap_account(account_key)
+    elif not account_key and ACCOUNTS:
+        # Default to first account to ensure consistent state after restarts
+        account_key = list(ACCOUNTS.keys())[0]
+        _swap_account(account_key)
 
     job_id = str(uuid.uuid4())[:8]
     task_store[job_id] = {

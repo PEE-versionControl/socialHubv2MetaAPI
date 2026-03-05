@@ -107,11 +107,11 @@ export async function fetchAccounts(): Promise<Account[]> {
   return res.json();
 }
 
-export async function submitUrlReport(urls: ReportUrlEntry[], include_live: boolean): Promise<{ job_id: string }> {
+export async function submitUrlReport(urls: ReportUrlEntry[], include_live: boolean, account_key?: string): Promise<{ job_id: string }> {
   const res = await fetch(`${API_BASE}/api/report/by-urls`, {
     method: 'POST',
     headers: apiHeaders({ 'Content-Type': 'application/json' }),
-    body: JSON.stringify({ urls, include_live }),
+    body: JSON.stringify({ urls, include_live, account_key: account_key || '' }),
   });
   if (!res.ok) throw new Error(`Failed: ${res.statusText}`);
   return res.json();
